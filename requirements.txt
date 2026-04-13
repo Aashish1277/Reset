@@ -1,4 +1,7 @@
-Flask
+flask
 pyTelegramBotAPI
 requests
+httpx
 beautifulsoup4
+user-agent
+cfonts
