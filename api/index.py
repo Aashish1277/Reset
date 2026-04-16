@@ -1,29 +1,40 @@
 # api/index.py
 import os
+import sys
+import traceback
 import random
 import string
 import uuid
 import requests
 import json
+import asyncio
 from datetime import datetime
 from flask import Flask, request, Response
+
+# Telegram imports
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # --- Configuration ---
-# !!! IMPORTANT: Set this as an Environment Variable in Vercel for security !!!
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_PUBLIC_TOKEN_FROM_EARLIER")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN environment variable not set!", file=sys.stderr)
+    # We'll still let Flask run, but the bot will fail gracefully when called
 
 # --- Flask App Setup ---
 app = Flask(__name__)
 
-# --- Telegram Bot Setup ---
-bot = Bot(token=BOT_TOKEN)
-# We need a separate PTB application to handle updates
-# build=True is required for webhook setups
-ptb_app = Application.builder().token(BOT_TOKEN).build()
+# --- Telegram Bot Application Setup ---
+# Important: We create a single Application instance that will be reused across requests
+# to avoid recreating the event loop each time.
+if BOT_TOKEN:
+    bot = Bot(token=BOT_TOKEN)
+    ptb_app = Application.builder().token(BOT_TOKEN).build()
+else:
+    bot = None
+    ptb_app = None
 
-# --- Instagram Reset Functions (Kept exactly the same as before) ---
+# --- Instagram Reset Functions (same as before) ---
 def generate_device_info():
     ANDROID_ID = f"android-{''.join(random.choices(string.hexdigits.lower(), k=16))}"
     USER_AGENT = f"Instagram 394.0.0.46.81 Android ({random.choice(['28/9','29/10','30/11','31/12'])}; {random.choice(['240dpi','320dpi','480dpi'])}; {random.choice(['720x1280','1080x1920','1440x2560'])}; {random.choice(['samsung','xiaomi','huawei','oneplus','google'])}; {random.choice(['SM-G975F','Mi-9T','P30-Pro','ONEPLUS-A6003','Pixel-4'])}; intel; en_US; {random.randint(100000000,999999999)})"
@@ -118,7 +129,7 @@ def reset_instagram_password(reset_link):
     except Exception as e:
         return {"success": False, "error": str(e)}
 
-# --- Bot Handlers ---
+# --- Bot Handlers (same as before) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Send me an Instagram password reset link (the link from the email).\n"
@@ -130,8 +141,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "uidb36=" in text and "token=" in text:
         await update.message.reply_text("⏳ Processing reset link...")
 
-        # Run the blocking reset function (not async)
-        result = reset_instagram_password(text)
+        # Run the blocking function in a thread to avoid blocking the event loop
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, reset_instagram_password, text)
 
         if result.get("success"):
             user_id = result.get("user_id")
@@ -156,23 +168,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Please send the full link from the email (contains `uidb36` and `token`)."
         )
 
-# Register handlers with the PTB application
-ptb_app.add_handler(CommandHandler("start", start))
-ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+# Register handlers only once
+if ptb_app:
+    ptb_app.add_handler(CommandHandler("start", start))
+    ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 # --- Flask Webhook Route ---
-@app.route("/api/index", methods=["POST", "GET"])
+@app.route("/api/index", methods=["POST"])
 def webhook():
-    if request.method == "POST":
-        # Process the incoming update from Telegram
-        update = Update.de_json(request.get_json(force=True), bot)
-        # Use the PTB application to process the update asynchronously
-        # Since we're in a sync Flask route, we need to run the async function
-        import asyncio
-        asyncio.run(ptb_app.process_update(update))
+    if not ptb_app:
+        return Response("Bot token not configured", status=500)
+    
+    try:
+        # Parse the incoming update from Telegram
+        data = request.get_json(force=True)
+        update = Update.de_json(data, bot)
+        
+        # Process the update asynchronously
+        # Since we're inside a sync Flask route, we need to create a new event loop
+        # for this invocation only. Vercel runs each request in a fresh environment.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(ptb_app.process_update(update))
+        loop.close()
+        
         return Response("ok", status=200)
-    return "This is a webhook endpoint for a Telegram bot.", 200
+    except Exception as e:
+        # Log the full error to Vercel's logs
+        print(f"Error processing update: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        return Response("error", status=500)
 
-# This block is only for local testing. Vercel will ignore it.
-if __name__ == "__main__":
-    app.run(debug=True)
+# A simple GET route for health checks (optional)
+@app.route("/api/index", methods=["GET"])
+def health():
+    return "Bot webhook is running", 200
+
+# Vercel expects a variable named `app` as the entry point.
+# This is already defined above. 
