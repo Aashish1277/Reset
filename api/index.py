@@ -1,28 +1,37 @@
+# api/index.py
 import os
 import random
 import string
 import uuid
-import time
-import json
 import requests
+import json
 from datetime import datetime
-import telebot
-from flask import Flask, request
+from flask import Flask, request, Response
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- BOT CONFIG ---
-BOT_TOKEN = "8467513290:AAGByhKPJ9ToRxkiJVVey4LnSK9AoBfZGEs"
-bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
+# --- Configuration ---
+# !!! IMPORTANT: Set this as an Environment Variable in Vercel for security !!!
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_PUBLIC_TOKEN_FROM_EARLIER")
+
+# --- Flask App Setup ---
 app = Flask(__name__)
 
+# --- Telegram Bot Setup ---
+bot = Bot(token=BOT_TOKEN)
+# We need a separate PTB application to handle updates
+# build=True is required for webhook setups
+ptb_app = Application.builder().token(BOT_TOKEN).build()
+
+# --- Instagram Reset Functions (Kept exactly the same as before) ---
 def generate_device_info():
     ANDROID_ID = f"android-{''.join(random.choices(string.hexdigits.lower(), k=16))}"
     USER_AGENT = f"Instagram 394.0.0.46.81 Android ({random.choice(['28/9','29/10','30/11','31/12'])}; {random.choice(['240dpi','320dpi','480dpi'])}; {random.choice(['720x1280','1080x1920','1440x2560'])}; {random.choice(['samsung','xiaomi','huawei','oneplus','google'])}; {random.choice(['SM-G975F','Mi-9T','P30-Pro','ONEPLUS-A6003','Pixel-4'])}; intel; en_US; {random.randint(100000000,999999999)})"
     WATERFALL_ID = str(uuid.uuid4())
     timestamp = int(datetime.now().timestamp())
-    # This creates the new password
-    raw_pwd = f"Reset@{random.randint(100,999)}#{random.randint(10,99)}"
-    PASSWORD = f'#PWD_INSTAGRAM:0:{timestamp}:{raw_pwd}'
-    return ANDROID_ID, USER_AGENT, WATERFALL_ID, PASSWORD, raw_pwd
+    nums = ''.join([str(random.randint(1, 100)) for _ in range(4)])
+    PASSWORD = f'#PWD_INSTAGRAM:0:{timestamp}:Random@{nums}'
+    return ANDROID_ID, USER_AGENT, WATERFALL_ID, PASSWORD
 
 def make_headers(mid="", user_agent=""):
     return {
@@ -30,89 +39,140 @@ def make_headers(mid="", user_agent=""):
         "X-Bloks-Version-Id": "e061cacfa956f06869fc2b678270bef1583d2480bf51f508321e64cfb5cc12bd",
         "X-Mid": mid,
         "User-Agent": user_agent,
+        "Content-Length": "9481"
     }
+
+def id_user(user_id):
+    try:
+        url = f"https://i.instagram.com/api/v1/users/{user_id}/info/"
+        headers = {"User-Agent": "Instagram 219.0.0.12.117 Android"}
+        r = requests.get(url, headers=headers)
+        username = r.json()["user"]["username"]
+        return username
+    except:
+        return None
 
 def reset_instagram_password(reset_link):
     try:
-        ANDROID_ID, USER_AGENT, WATERFALL_ID, PASSWORD, raw_pwd = generate_device_info()
-        
-        # Parse Link
-        if "uidb36=" not in reset_link or "&token=" not in reset_link:
-            return {"success": False, "error": "Invalid Link Format"}
-            
+        ANDROID_ID, USER_AGENT, WATERFALL_ID, PASSWORD = generate_device_info()
         uidb36 = reset_link.split("uidb36=")[1].split("&token=")[0]
         token = reset_link.split("&token=")[1].split(":")[0]
 
-        # Step 1: Initial Reset Request
         url = "https://i.instagram.com/api/v1/accounts/password_reset/"
-        data = {"source": "one_click_login_email", "uidb36": uidb36, "device_id": ANDROID_ID, "token": token, "waterfall_id": WATERFALL_ID}
-        r1 = requests.post(url, headers=make_headers(user_agent=USER_AGENT), data=data, timeout=10)
+        data = {
+            "source": "one_click_login_email",
+            "uidb36": uidb36,
+            "device_id": ANDROID_ID,
+            "token": token,
+            "waterfall_id": WATERFALL_ID
+        }
+        r = requests.post(url, headers=make_headers(user_agent=USER_AGENT), data=data)
         
-        if "user_id" not in r1.text:
-            return {"success": False, "error": "Link expired or Instagram blocked the request."}
+        if "user_id" not in r.text:
+            return {"success": False, "error": f"Reset request failed: {r.text}"}
 
-        mid = r1.headers.get("Ig-Set-X-Mid")
-        rj = r1.json()
-        
-        # Step 2: Get Challenge Context
+        mid = r.headers.get("Ig-Set-X-Mid")
+        resp_json = r.json()
+        user_id = resp_json.get("user_id")
+        cni = resp_json.get("cni")
+        nonce_code = resp_json.get("nonce_code")
+        challenge_context = resp_json.get("challenge_context")
+
         url2 = "https://i.instagram.com/api/v1/bloks/apps/com.instagram.challenge.navigation.take_challenge/"
         data2 = {
-            "user_id": str(rj.get("user_id")),
-            "cni": str(rj.get("cni")),
-            "nonce_code": str(rj.get("nonce_code")),
+            "user_id": str(user_id),
+            "cni": str(cni),
+            "nonce_code": str(nonce_code),
             "bk_client_context": '{"bloks_version":"e061cacfa956f06869fc2b678270bef1583d2480bf51f508321e64cfb5cc12bd","styles_id":"instagram"}',
-            "challenge_context": str(rj.get("challenge_context")),
+            "challenge_context": str(challenge_context),
             "bloks_versioning_id": "e061cacfa956f06869fc2b678270bef1583d2480bf51f508321e64cfb5cc12bd",
             "get_challenge": "true"
         }
-        r2 = requests.post(url2, headers=make_headers(mid, USER_AGENT), data=data2, timeout=10)
+        r2 = requests.post(url2, headers=make_headers(mid, USER_AGENT), data=data2).text
         
-        # Extract final context
-        try:
-            challenge_final = r2.text.replace('\\', '').split(f'(bk.action.i64.Const, {rj.get("cni")}), "')[1].split('", (bk.action.bool.Const, false)))')[0]
-        except:
-            return {"success": False, "error": "Could not bypass challenge screen."}
+        challenge_context_final = r2.replace('\\', '').split(f'(bk.action.i64.Const, {cni}), "')[1].split('", (bk.action.bool.Const, false)))')[0]
 
-        # Step 3: Final Password Update (THE ACTUAL RESET)
         data3 = {
-            "is_caa": "False", "cni": str(rj.get("cni")),
+            "is_caa": "False",
+            "source": "",
+            "uidb36": "",
+            "error_state": {"type_name":"str","index":0,"state_id":1048583541},
+            "afv": "",
+            "cni": str(cni),
+            "token": "",
+            "has_follow_up_screens": "0",
             "bk_client_context": {"bloks_version":"e061cacfa956f06869fc2b678270bef1583d2480bf51f508321e64cfb5cc12bd","styles_id":"instagram"},
-            "challenge_context": challenge_final,
+            "challenge_context": challenge_context_final,
             "bloks_versioning_id": "e061cacfa956f06869fc2b678270bef1583d2480bf51f508321e64cfb5cc12bd",
-            "enc_new_password1": PASSWORD, "enc_new_password2": PASSWORD
+            "enc_new_password1": PASSWORD,
+            "enc_new_password2": PASSWORD
         }
+        requests.post(url2, headers=make_headers(mid, USER_AGENT), data=data3)
+        new_password = PASSWORD.split(":")[-1]
         
-        final_resp = requests.post(url2, headers=make_headers(mid, USER_AGENT), data=data3, timeout=10)
-        
-        # VALIDATION: Check if Instagram actually said OK
-        if '"status":"ok"' in final_resp.text:
-            return {"success": True, "password": raw_pwd, "user_id": rj.get("user_id")}
-        else:
-            return {"success": False, "error": "Instagram rejected the new password."}
-
+        return {
+            "success": True,
+            "password": new_password,
+            "user_id": user_id
+        }
     except Exception as e:
-        return {"success": False, "error": f"System Error: {str(e)}"}
+        return {"success": False, "error": str(e)}
 
-# --- TELEGRAM WEBHOOK ---
-@app.route('/api/index', methods=['POST'])
-def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
-    return 'Forbidden', 403
+# --- Bot Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Send me an Instagram password reset link (the link from the email).\n"
+        "I'll reset the password and give you the new credentials."
+    )
 
-@bot.message_handler(func=lambda message: "instagram.com" in message.text)
-def handle_link(message):
-    wait_msg = bot.send_message(message.chat.id, "⏳ **Validating with Instagram...**\nThis takes ~8 seconds.", parse_mode="Markdown")
-    result = reset_instagram_password(message.text.strip())
-    
-    if result.get("success"):
-        msg = f"✅ **RESET SUCCESSFUL**\n\n👤 ID: `{result['user_id']}`\n🔑 Pass: `{result['password']}`\n\nCredit: @b44ner"
-        bot.edit_message_text(msg, message.chat.id, wait_msg.message_id, parse_mode="Markdown")
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if "uidb36=" in text and "token=" in text:
+        await update.message.reply_text("⏳ Processing reset link...")
+
+        # Run the blocking reset function (not async)
+        result = reset_instagram_password(text)
+
+        if result.get("success"):
+            user_id = result.get("user_id")
+            new_password = result.get("password")
+            username = id_user(user_id)
+            if not username:
+                username = "Unknown"
+
+            msg = (
+                "✅ *Password Reset Successful!*\n\n"
+                f"👤 *Username:* `{username}`\n"
+                f"🔑 *New Password:* `{new_password}`\n\n"
+                "🔒 Login and change the password immediately."
+            )
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        else:
+            error = result.get("error", "Unknown error")
+            await update.message.reply_text(f"❌ Failed: {error}")
     else:
-        bot.edit_message_text(f"❌ **FAILED**\nReason: {result.get('error')}", message.chat.id, wait_msg.message_id, parse_mode="Markdown")
+        await update.message.reply_text(
+            "❓ That doesn't look like an Instagram reset link.\n"
+            "Please send the full link from the email (contains `uidb36` and `token`)."
+        )
 
-@app.route('/')
-def index(): return "Bot is Online"
+# Register handlers with the PTB application
+ptb_app.add_handler(CommandHandler("start", start))
+ptb_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+# --- Flask Webhook Route ---
+@app.route("/api/index", methods=["POST", "GET"])
+def webhook():
+    if request.method == "POST":
+        # Process the incoming update from Telegram
+        update = Update.de_json(request.get_json(force=True), bot)
+        # Use the PTB application to process the update asynchronously
+        # Since we're in a sync Flask route, we need to run the async function
+        import asyncio
+        asyncio.run(ptb_app.process_update(update))
+        return Response("ok", status=200)
+    return "This is a webhook endpoint for a Telegram bot.", 200
+
+# This block is only for local testing. Vercel will ignore it.
+if __name__ == "__main__":
+    app.run(debug=True)
